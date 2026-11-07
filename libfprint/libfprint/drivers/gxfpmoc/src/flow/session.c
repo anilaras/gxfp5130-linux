@@ -14,6 +14,7 @@
 #include "session_internal.h"
 
 #include <errno.h>
+#include <math.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -164,6 +165,12 @@ session_reset_buffers(struct gxfp_session *s)
         gxfp_fpn_free(&SESSION(s)->dark);
         SESSION(s)->dark_loaded = 0;
     }
+    free(SESSION(s)->dark_first);
+    SESSION(s)->dark_first = NULL;
+    SESSION(s)->dark_pair_valid = 0;
+    free(SESSION(s)->dark_ref);
+    SESSION(s)->dark_ref = NULL;
+    SESSION(s)->dark_ref_count = 0;
 
     if (SESSION(s)->pending_img_ready) {
         gxfp_decoded_image_free(&SESSION(s)->pending_img);
@@ -326,6 +333,94 @@ session_rearm_tls_if_needed(struct gxfp_session *s, int enable_log, struct gxfp_
                           GXFP_SESSION_ERR_TARGET_ACTIVATE,
                           "tls_service init failed: %s",
                           strerror(-r));
+}
+
+/* Debug aid: with FP_GXFP_DUMP=<dir>, write raw 12-bit frames as 16-bit PGM. */
+static void
+session_dump_image(const char *kind, const struct gxfp_decoded_image *img)
+{
+    static unsigned int seq;
+    const char *dir = getenv("FP_GXFP_DUMP");
+    char path[512];
+    FILE *f;
+
+    if (!dir || !img || !img->pixels)
+        return;
+
+    snprintf(path, sizeof(path), "%s/%lld-%03u-%s.pgm", dir,
+             (long long)gxfp_monotonic_ms(), seq++, kind);
+    f = fopen(path, "wb");
+    if (!f)
+        return;
+    fprintf(f, "P5\n%d %d\n4095\n", img->cols, img->rows);
+    for (int i = 0; i < img->rows * img->cols; i++) {
+        fputc(img->pixels[i] >> 8, f);
+        fputc(img->pixels[i] & 0xff, f);
+    }
+    fclose(f);
+}
+
+/*
+ * A dark frame taken while a finger is (still/already) on the sensor ruins
+ * every capture of the session: subtracting it erases the ridges. On
+ * GF_GCC_EC_20055 clean dark frames average ~2650-2750 while frames with a
+ * finger average ~1000-1300, so reject dark frames below an absolute floor
+ * (FP_GXFP_DARK_MIN, 0 disables) or well below a clean one seen earlier.
+ */
+#define GXFP_DARK_MIN_MEAN_DEFAULT 2000.0
+#define GXFP_DARK_GOOD_RATIO 0.75
+#define GXFP_DARK_MAX_RETRIES 5
+
+static double
+session_image_mean(const struct gxfp_decoded_image *img)
+{
+    double sum = 0.0;
+    int total = img->rows * img->cols;
+
+    for (int i = 0; i < total; i++)
+        sum += img->pixels[i];
+    return total > 0 ? sum / total : 0.0;
+}
+
+static int
+session_dark_is_contaminated(struct gxfp_session *s, double mean)
+{
+    const char *env = getenv("FP_GXFP_DARK_MIN");
+    double floor = env ? strtod(env, NULL) : GXFP_DARK_MIN_MEAN_DEFAULT;
+
+    if (floor <= 0.0)
+        return 0;
+    if (mean < floor)
+        return 1;
+    if (SESSION(s)->good_dark_mean > 0.0 &&
+        mean < SESSION(s)->good_dark_mean * GXFP_DARK_GOOD_RATIO)
+        return 1;
+    return 0;
+}
+
+/*
+ * Raw-output mode: how long activation waits for the "no finger" report
+ * before giving up on a fresh dark frame. A clear sensor answers within a few
+ * hundred ms; a finger already on it would otherwise hold activation until it
+ * is lifted, so the press is never seen.
+ */
+#define GXFP_RAW_WAIT_UP_GRACE_MS 500
+
+static void
+session_diff_stats(const uint16_t *a, const uint16_t *b, int total,
+                   double *mean, double *std)
+{
+    double sum = 0.0, sum2 = 0.0;
+
+    for (int i = 0; i < total; i++) {
+        double d = (double)a[i] - (double)b[i];
+
+        sum += d;
+        sum2 += d * d;
+    }
+    sum /= total;
+    *mean = sum;
+    *std = sum2 / total - sum * sum > 0.0 ? sqrt(sum2 / total - sum * sum) : 0.0;
 }
 
 static int
@@ -527,6 +622,10 @@ session_maybe_finish_activation(struct gxfp_session *s, struct gxfp_session_even
         return;
 
     SESSION(s)->mode = GXFP_MODE_ACTIVATING_WAIT_UP;
+    SESSION(s)->dark_retries = 0;
+    free(SESSION(s)->dark_first);
+    SESSION(s)->dark_first = NULL;
+    SESSION(s)->dark_pair_valid = 0;
     ev->request_tick = 1;
     ev->tick_delay_ms = 0;
 }
@@ -567,7 +666,85 @@ session_finalize_capture(struct gxfp_session *s,
     }
 
     if (SESSION(s)->mode == GXFP_MODE_ACTIVATING_DARK_CAPTURE) {
-        r = session_set_dark_from_image(s, &img);
+        double mean = session_image_mean(&img);
+
+        session_dump_image("dark", &img);
+
+        /*
+         * Raw-output users validate the dark frame themselves. Give them a
+         * second frame to compare against: a sensor still shedding the last
+         * finger's latent print drifts within a fraction of a second, while a
+         * rested (even dirty) one stays put.
+         */
+        if (SESSION(s)->raw_output && !SESSION(s)->dark_first && SESSION(s)->dark_ref &&
+            SESSION(s)->dark_ref_count == (size_t)img.rows * (size_t)img.cols) {
+            double m, sd;
+
+            session_diff_stats(img.pixels, SESSION(s)->dark_ref, img.rows * img.cols, &m, &sd);
+            if (fabs(m) <= SESSION(s)->dark_ref_max_mean && sd <= SESSION(s)->dark_ref_max_std) {
+                SESSION(s)->dark_pair_mean = m;
+                SESSION(s)->dark_pair_std = sd;
+                SESSION(s)->dark_pair_valid = 1;
+                goto dark_measured;
+            }
+        }
+        if (SESSION(s)->raw_output && !SESSION(s)->dark_first) {
+            size_t bytes = (size_t)img.rows * (size_t)img.cols * sizeof(uint16_t);
+
+            SESSION(s)->dark_first = (uint16_t *)malloc(bytes);
+            if (SESSION(s)->dark_first) {
+                memcpy(SESSION(s)->dark_first, img.pixels, bytes);
+                gxfp_decoded_image_free(&img);
+                SESSION(s)->fdt.state = GXFP_FDT_STATE_UNKNOWN;
+                session_set_fdt_mode(s, ev, GXFP_FDT_MODE_IDLE);
+                if (!ev->session_error)
+                    session_set_fdt_mode(s, ev, GXFP_FDT_MODE_WAIT_UP);
+                if (ev->session_error)
+                    return;
+                SESSION(s)->mode = GXFP_MODE_ACTIVATING_WAIT_UP;
+                ev->request_tick = 1;
+                ev->tick_delay_ms = 0;
+                return;
+            }
+        }
+        if (SESSION(s)->raw_output && SESSION(s)->dark_first) {
+            session_diff_stats(img.pixels, SESSION(s)->dark_first, img.rows * img.cols,
+                               &SESSION(s)->dark_pair_mean, &SESSION(s)->dark_pair_std);
+            SESSION(s)->dark_pair_valid = 1;
+        }
+dark_measured:
+        /* Raw-output users validate the dark frame themselves; don't stall them. */
+        if (!SESSION(s)->raw_output && session_dark_is_contaminated(s, mean)) {
+            if (SESSION(s)->dark_retries < GXFP_DARK_MAX_RETRIES) {
+                /* Wait for finger-up again and retake the dark frame. */
+                SESSION(s)->dark_retries++;
+                if (getenv("FP_GXFP_LOG"))
+                    fprintf(stderr, "gxfp: dark frame mean %.0f looks touched, retry %d/%d\n",
+                            mean, SESSION(s)->dark_retries, GXFP_DARK_MAX_RETRIES);
+                gxfp_decoded_image_free(&img);
+                SESSION(s)->fdt.state = GXFP_FDT_STATE_UNKNOWN;
+                session_set_fdt_mode(s, ev, GXFP_FDT_MODE_IDLE);
+                if (!ev->session_error)
+                    session_set_fdt_mode(s, ev, GXFP_FDT_MODE_WAIT_UP);
+                if (ev->session_error)
+                    return;
+                SESSION(s)->mode = GXFP_MODE_ACTIVATING_WAIT_UP;
+                ev->request_tick = 1;
+                ev->tick_delay_ms = 0;
+                return;
+            }
+            if (getenv("FP_GXFP_LOG"))
+                fprintf(stderr, "gxfp: dark frame mean %.0f still looks touched, %s\n",
+                        mean, SESSION(s)->dark_loaded ? "keeping previous dark frame" : "using it anyway");
+        } else {
+            SESSION(s)->good_dark_mean = mean;
+        }
+
+        if (SESSION(s)->dark_loaded && !SESSION(s)->raw_output &&
+            session_dark_is_contaminated(s, mean))
+            r = 0;
+        else
+            r = session_set_dark_from_image(s, &img);
         gxfp_decoded_image_free(&img);
         if (r < 0) {
             session_set_error(s, ev, r, GXFP_SESSION_ERR_TARGET_ACTIVATE, "dark frame failed: %s", strerror(-r));
@@ -583,7 +760,8 @@ session_finalize_capture(struct gxfp_session *s,
         return;
     }
 
-    if (SESSION(s)->dark_loaded) {
+    session_dump_image("raw", &img);
+    if (SESSION(s)->dark_loaded && !SESSION(s)->raw_output) {
         r = gxfp_fpn_correct(img.pixels, img.rows, img.cols, &SESSION(s)->dark);
         if (r < 0) {
             gxfp_decoded_image_free(&img);
@@ -662,6 +840,23 @@ gxfp_session_pump(struct gxfp_session *s,
     session_maybe_finish_activation(s, ev);
     if (ev->session_error)
         return;
+
+    /* A finger is already down: finish activation without a fresh dark frame. */
+    if (SESSION(s)->raw_output && SESSION(s)->mode == GXFP_MODE_ACTIVATING_WAIT_UP &&
+        SESSION(s)->fdt.wait_up_armed_ms > 0 &&
+        gxfp_monotonic_ms() - SESSION(s)->fdt.wait_up_armed_ms >= GXFP_RAW_WAIT_UP_GRACE_MS) {
+        if (getenv("FP_GXFP_LOG"))
+            fprintf(stderr, "gxfp: sensor busy at activation, skipping dark frame\n");
+        free(SESSION(s)->dark_first);
+        SESSION(s)->dark_first = NULL;
+        SESSION(s)->dark_pair_valid = 0;
+        session_set_fdt_mode(s, ev, GXFP_FDT_MODE_IDLE);
+        if (ev->session_error)
+            return;
+        SESSION(s)->mode = GXFP_MODE_IDLE;
+        ev->activate_complete = 1;
+        return;
+    }
 
     if (SESSION(s)->mode == GXFP_MODE_WAIT_FINGER_OFF ||
         SESSION(s)->mode == GXFP_MODE_ACTIVATING_WAIT_UP) {
@@ -861,6 +1056,72 @@ gxfp_session_take_image(struct gxfp_session *s, struct gxfp_decoded_image *out)
     *out = SESSION(s)->pending_img;
     memset(&SESSION(s)->pending_img, 0, sizeof(SESSION(s)->pending_img));
     SESSION(s)->pending_img_ready = 0;
+    return 0;
+}
+
+void
+gxfp_session_set_raw_output(struct gxfp_session *s, int enable)
+{
+    if (!s || !s->impl)
+        return;
+    SESSION(s)->raw_output = enable ? 1 : 0;
+}
+
+int
+gxfp_session_get_dark(const struct gxfp_session *s, uint16_t *out,
+                      size_t out_count, int *rows, int *cols)
+{
+    size_t count;
+
+    if (!s || !s->impl || !out)
+        return -EINVAL;
+    if (!SESSION(s)->dark_loaded || !SESSION(s)->dark.pixels)
+        return -ENOENT;
+
+    count = (size_t)SESSION(s)->dark.rows * (size_t)SESSION(s)->dark.cols;
+    if (count > out_count)
+        return -EMSGSIZE;
+
+    memcpy(out, SESSION(s)->dark.pixels, count * sizeof(uint16_t));
+    if (rows)
+        *rows = SESSION(s)->dark.rows;
+    if (cols)
+        *cols = SESSION(s)->dark.cols;
+    return (int)count;
+}
+
+void
+gxfp_session_set_dark_reference(struct gxfp_session *s, const uint16_t *ref,
+                                size_t count, double max_mean, double max_std)
+{
+    if (!s || !s->impl)
+        return;
+    free(SESSION(s)->dark_ref);
+    SESSION(s)->dark_ref = NULL;
+    SESSION(s)->dark_ref_count = 0;
+    if (!ref || !count)
+        return;
+    SESSION(s)->dark_ref = (uint16_t *)malloc(count * sizeof(uint16_t));
+    if (!SESSION(s)->dark_ref)
+        return;
+    memcpy(SESSION(s)->dark_ref, ref, count * sizeof(uint16_t));
+    SESSION(s)->dark_ref_count = count;
+    SESSION(s)->dark_ref_max_mean = max_mean;
+    SESSION(s)->dark_ref_max_std = max_std;
+}
+
+int
+gxfp_session_get_dark_stability(const struct gxfp_session *s,
+                                double *mean_diff, double *std_diff)
+{
+    if (!s || !s->impl)
+        return -EINVAL;
+    if (!SESSION(s)->dark_pair_valid)
+        return -ENOENT;
+    if (mean_diff)
+        *mean_diff = SESSION(s)->dark_pair_mean;
+    if (std_diff)
+        *std_diff = SESSION(s)->dark_pair_std;
     return 0;
 }
 

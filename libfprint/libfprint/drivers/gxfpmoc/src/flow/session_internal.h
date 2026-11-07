@@ -34,6 +34,17 @@ struct gxfp_session_impl {
 
     struct gxfp_fpn_dark dark;
     int dark_loaded;
+    int dark_retries;
+    int raw_output;
+    uint16_t *dark_first;
+    uint16_t *dark_ref;
+    size_t dark_ref_count;
+    double dark_ref_max_mean;
+    double dark_ref_max_std;
+    int dark_pair_valid;
+    double dark_pair_mean;
+    double dark_pair_std;
+    double good_dark_mean;
 
     struct gxfp_decoded_image pending_img;
     int pending_img_ready;

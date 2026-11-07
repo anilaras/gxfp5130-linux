@@ -7,6 +7,9 @@
 #include "gxfp/algo/common.h"
 
 #include <errno.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define GXFP_FDT_BASE_TABLE_LEN 24
@@ -31,6 +34,30 @@
  * starts, leaving the user with no fingerprint at all. 20 re-arms = ~15 s.
  */
 #define FDT_WAIT_UP_MAX_RETRIES 20
+
+/*
+ * The MCU sometimes reports a saturated (0xff) or empty (0x00) baseline.
+ * Deriving the up/down threshold tables from it yields a threshold the
+ * sensor can never cross, so finger-up is never reported and WAIT_UP times
+ * out. Backported from Void755/gxfpmoc 42860c1.
+ */
+static bool fdt_base_valid(const uint8_t *raw, size_t raw_len)
+{
+	size_t i;
+
+	if (!raw || raw_len < 2)
+		return false;
+
+	for (i = 0; i + 1 < raw_len; i += 2) {
+		uint16_t value = gxfp_le16(raw + i);
+		uint8_t half = (uint8_t)(value >> 1);
+
+		if (half == 0x00 || half == 0xff)
+			return false;
+	}
+
+	return true;
+}
 
 static void fdt_downbase_from_raw(const uint8_t *raw_base,
 				  size_t raw_len,
@@ -102,13 +129,13 @@ static void fdt_upbase_from_raw(uint16_t touchflag,
 	memcpy(out_table, merged, sizeof(merged));
 }
 
-static void fdt_base_table_update_from_frame(struct gxfp_cmd_fdt_state *state,
+static bool fdt_base_table_update_from_frame(struct gxfp_cmd_fdt_state *state,
 					     const struct gxfp_frame_parsed *frame)
 {
 	uint16_t irq_status;
 
-	if (!state || !frame)
-		return;
+	if (!state || !frame || !frame->payload)
+		return false;
 
 	irq_status = gxfp_le16(frame->payload);
 
@@ -119,11 +146,16 @@ static void fdt_base_table_update_from_frame(struct gxfp_cmd_fdt_state *state,
 		int second_flag = state->up_second_flag;
 
 		if (frame->payload_len < 4)
-			return;
+			return false;
 
 		touchflag = gxfp_le16(frame->payload + 2);
 		raw_base = frame->payload + 4;
 		raw_len = frame->payload_len - 4;
+		if (raw_len > (GXFP_FDT_BASE_UPDATE_ENTRIES * 2))
+			raw_len = GXFP_FDT_BASE_UPDATE_ENTRIES * 2;
+
+		if (!fdt_base_valid(raw_base, raw_len))
+			return false;
 
 		if (state->up_need_twice) {
 			second_flag = (state->up_round > 0) ? 1 : 0;
@@ -137,7 +169,7 @@ static void fdt_base_table_update_from_frame(struct gxfp_cmd_fdt_state *state,
 				   raw_base,
 				   raw_len,
 				   state->up_table_5130);
-		return;
+		return true;
 	}
 
 	if (irq_status == FDT_STATUS_IRQ_UP_GET_DOWN_BASE ||
@@ -147,24 +179,32 @@ static void fdt_base_table_update_from_frame(struct gxfp_cmd_fdt_state *state,
 		size_t raw_len;
 
 		if (frame->payload_len < 4)
-			return;
+			return false;
 
 		raw_base = frame->payload + 4;
 		raw_len = frame->payload_len - 4;
 		if (raw_len > (GXFP_FDT_BASE_UPDATE_ENTRIES * 2))
 			raw_len = GXFP_FDT_BASE_UPDATE_ENTRIES * 2;
 
+		if (!fdt_base_valid(raw_base, raw_len))
+			return false;
+
 		fdt_downbase_from_raw(raw_base, raw_len, state->down_table_5130);
+		return true;
 	}
+
+	return true;
 }
 
 static int fdt_update_state_from_record(struct gxfp_cmd_fdt_state *state,
 					const struct gxfp_tap_hdr *tap_hdr,
 					const uint8_t *payload,
 					size_t payload_len,
-					uint16_t *out_status)
+					uint16_t *out_status,
+					bool *out_base_valid)
 {
 	struct gxfp_frame_parsed frame;
+	bool base_valid;
 
 	if (!state)
 		return -EINVAL;
@@ -191,10 +231,20 @@ static int fdt_update_state_from_record(struct gxfp_cmd_fdt_state *state,
 	if (!state->base_table_inited)
 		gxfp_cmd_fdt_state_init(state);
 
-	fdt_base_table_update_from_frame(state, &frame);
+	base_valid = fdt_base_table_update_from_frame(state, &frame);
+
+	if (getenv("FP_GXFP_LOG")) {
+		fprintf(stderr, "gxfp-fdt: cmd=0x%02x status=0x%04x valid=%d base=",
+			frame.cmd, gxfp_le16(frame.payload), base_valid ? 1 : 0);
+		for (size_t i = 2; i < frame.payload_len && i < 26; i++)
+			fprintf(stderr, "%02x", frame.payload[i]);
+		fprintf(stderr, "\n");
+	}
 
 	if (out_status)
 		*out_status = gxfp_le16(frame.payload);
+	if (out_base_valid)
+		*out_base_valid = base_valid;
 
 	return 0;
 }
@@ -276,17 +326,43 @@ int gxfp_fdt_flow_feed_record(struct gxfp_fdt_flow *flow,
 {
 	uint16_t status = 0;
 	uint32_t events;
+	bool base_valid = true;
 	int r;
 
 	if (!flow || !dev || !tap_hdr || !payload || !out_events)
 		return -EINVAL;
 
 	*out_events = GXFP_FDT_EVENT_NONE;
-	r = fdt_update_state_from_record(&flow->cmd, tap_hdr, payload, payload_len, &status);
+	r = fdt_update_state_from_record(&flow->cmd, tap_hdr, payload, payload_len,
+					 &status, &base_valid);
 	if (r < 0)
 		return (r == -EAGAIN || r == -ENOENT) ? -EAGAIN : r;
 
 	flow->last_status = status;
+
+	if (!base_valid) {
+		enum gxfp_fdt_mode mode = flow->mode;
+		int retries = flow->wait_up_retries;
+
+		/* Drop the report and re-arm the same mode with the old tables. */
+		flow->state = GXFP_FDT_STATE_UNKNOWN;
+		flow->mode = GXFP_FDT_MODE_IDLE;
+		if (mode == GXFP_FDT_MODE_WAIT_UP && flow->last_good_up_valid)
+			memcpy(flow->cmd.up_table_5130, flow->last_good_up_table,
+			       sizeof(flow->cmd.up_table_5130));
+		if (mode != GXFP_FDT_MODE_IDLE) {
+			r = gxfp_fdt_flow_set_mode(flow, dev, mode);
+			if (r < 0)
+				return r;
+		}
+		/* Invalid reports must not reset the WAIT_UP re-arm budget. */
+		if (mode == GXFP_FDT_MODE_WAIT_UP)
+			flow->wait_up_retries = retries + 1;
+
+		*out_events = GXFP_FDT_EVENT_BASE_INVALID;
+		return 0;
+	}
+
 	events = fdt_status_to_events(status);
 
 	if ((events & GXFP_FDT_EVENT_REVERSE) && flow->mode == GXFP_FDT_MODE_WAIT_DOWN) {

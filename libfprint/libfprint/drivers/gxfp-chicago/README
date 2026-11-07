@@ -1,0 +1,10 @@
+Native Goodix Chicago (ChicagoHS) matcher backend.
+
+Imported from https://github.com/berkekbgz/libfprint-goodix-spi
+commit 505dc7e4602cae828e5a1e80221f3fec8e15411e, files lib/goodix/chicago/* and
+lib/goodix/common/goodix-crc.{c,h}. LGPL-2.1-or-later, see COPYING and the
+per-file headers.
+
+Local changes:
+- goodix-crc.h include path flattened.
+- GOODIX_CHICAGO_RUNTIME_SELECTOR_THRESHOLD made overridable at build time.

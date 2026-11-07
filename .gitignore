@@ -20,3 +20,8 @@ scripts/patches/00*.patch
 # raw terminal recordings embed machine-id/boot-id and local user/host names
 docs/*.cast
 docs/*.cast.*
+
+# device-specific calibration copied from Windows (contains the sensor id)
+/calib/*.dat
+# fetched/patched fprintd source (kur.sh)
+/fprintd/

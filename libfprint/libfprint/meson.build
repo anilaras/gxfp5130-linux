@@ -164,6 +164,17 @@ driver_sources = {
             'drivers/gxfpmoc/src/cmd/tls_cmd.c',
             'drivers/gxfpmoc/src/tls/tls_service.c',
             'drivers/gxfpmoc/src/tls/tls_engine_mbedtls.c',
+            'drivers/gxfp-chicago/goodix-crc.c',
+            'drivers/gxfp-chicago/goodix-chicago-calibration.c',
+            'drivers/gxfp-chicago/goodix-chicago-preprocess.c',
+            'drivers/gxfp-chicago/goodix-chicago-feature.c',
+            'drivers/gxfp-chicago/goodix-chicago-enrollment.c',
+            'drivers/gxfp-chicago/goodix-chicago-late-rejection-compat.c',
+            'drivers/gxfp-chicago/goodix-chicago-late-rejection.c',
+            'drivers/gxfp-chicago/goodix-chicago-match.c',
+            'drivers/gxfp-chicago/goodix-chicago-runtime.c',
+            'drivers/gxfp-chicago/goodix-chicago-bir.c',
+            'drivers/gxfp-chicago/goodix-chicago-template.c',
         ],
 }
 
@@ -259,6 +270,7 @@ if 'gxfp' in drivers
     ])
     deps += declare_dependency(include_directories: [
         include_directories('drivers/gxfpmoc/include'),
+        include_directories('drivers/gxfp-chicago'),
     ])
 endif
 

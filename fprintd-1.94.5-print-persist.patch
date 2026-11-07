@@ -1,0 +1,158 @@
+diff --git a/meson.build b/meson.build
+index eebea25..2dadc5b 100644
+--- a/meson.build
++++ b/meson.build
+@@ -63,7 +63,9 @@ add_project_arguments(common_cflags, language: 'c')
+ 
+ host_system = host_machine.system()
+ glib_min_version = '2.64'
+-libfprint_min_version = '1.94.9'
++# The gxfp libfprint fork reports 1.94.5 but carries the API fprintd uses;
++# a missing symbol would fail the build (-Werror=implicit-function-declaration).
++libfprint_min_version = '1.94.5'
+ 
+ glib_version_def = 'GLIB_VERSION_@0@_@1@'.format(
+     glib_min_version.split('.')[0], glib_min_version.split('.')[1])
+diff --git a/src/device.c b/src/device.c
+index 4de4a10..8ec0de0 100644
+--- a/src/device.c
++++ b/src/device.c
+@@ -112,6 +112,8 @@ typedef struct
+ 
+   /* Required to restart the operation on a retry failure. */
+   FpPrint   *verify_data;
++  /* Serialized prints before a match, to persist adaptive-template updates. */
++  GHashTable *verify_print_snapshots;
+   GPtrArray *identify_data;
+   int        enroll_data;
+ 
+@@ -248,6 +250,7 @@ fprint_device_finalize (GObject *object)
+ 
+   g_clear_handle_id (&priv->verify_stop_wait_timeout_id, g_source_remove);
+   g_hash_table_destroy (priv->clients);
++  g_clear_pointer (&priv->verify_print_snapshots, g_hash_table_destroy);
+   session_data_set_new (priv, NULL, NULL);
+   g_clear_object (&priv->auth);
+   g_clear_object (&priv->dev);
+@@ -461,6 +464,10 @@ fprint_device_init (FprintDevice *device)
+   g_signal_connect (device, "g-authorize-method",
+                     G_CALLBACK (action_authorization_handler),
+                     NULL);
++
++  priv->verify_print_snapshots = g_hash_table_new_full (g_direct_hash, g_direct_equal,
++                                                        g_object_unref,
++                                                        (GDestroyNotify) g_bytes_unref);
+ }
+ 
+ FprintDevice *
+@@ -1535,6 +1542,65 @@ stoppable_action_stop (FprintDevice          *rdev,
+     stoppable_action_completed (rdev);
+ }
+ 
++/*
++ * Matchers with adaptive templates (e.g. the gxfp driver's Goodix Chicago
++ * templateStudy) update the matched print's data in place. Snapshot each
++ * print before the action and save it again after a successful match if its
++ * serialization changed.
++ */
++static void
++snapshot_verify_print (FprintDevice *rdev,
++                       FpPrint      *print)
++{
++  FprintDevicePrivate *priv = fprint_device_get_instance_private (rdev);
++  g_autoptr(GError) error = NULL;
++  g_autofree guchar *serialized = NULL;
++  gsize size;
++
++  if (!fp_print_serialize (print, &serialized, &size, &error))
++    {
++      g_warning ("Failed to snapshot print before verification: %s", error->message);
++      return;
++    }
++  g_hash_table_replace (priv->verify_print_snapshots, g_object_ref (print),
++                        g_bytes_new_take (g_steal_pointer (&serialized), size));
++}
++
++static void
++save_changed_verify_print (FprintDevice *rdev,
++                           FpPrint      *print)
++{
++  FprintDevicePrivate *priv = fprint_device_get_instance_private (rdev);
++  g_autoptr(GBytes) after = NULL;
++  g_autoptr(GError) error = NULL;
++  g_autofree guchar *serialized = NULL;
++  GBytes *before;
++  gsize size;
++  int r;
++
++  before = g_hash_table_lookup (priv->verify_print_snapshots, print);
++  if (!before)
++    return;
++  if (!fp_print_serialize (print, &serialized, &size, &error))
++    {
++      g_warning ("Failed to serialize print updated during verification: %s", error->message);
++      return;
++    }
++  after = g_bytes_new_take (g_steal_pointer (&serialized), size);
++  if (g_bytes_equal (before, after))
++    return;
++
++  r = store.print_data_save (print);
++  if (r != 0)
++    {
++      g_warning ("Failed to save print updated during verification: %d", r);
++      return;
++    }
++  g_debug ("Saved print updated during successful verification");
++  g_hash_table_replace (priv->verify_print_snapshots, g_object_ref (print),
++                        g_steal_pointer (&after));
++}
++
+ static void
+ match_cb (FpDevice *device,
+           FpPrint  *match,
+@@ -1552,6 +1618,9 @@ match_cb (FpDevice *device,
+   cancelled = g_cancellable_is_cancelled (priv->current_cancellable);
+   matched = match != NULL && cancelled == FALSE;
+ 
++  if (matched)
++    save_changed_verify_print (rdev, match);
++
+   report_verify_status (rdev, matched, error);
+ }
+ 
+@@ -1584,6 +1653,7 @@ verify_cb (FpDevice *dev, GAsyncResult *res, void *user_data)
+   else
+     {
+       g_clear_object (&priv->verify_data);
++      g_hash_table_remove_all (priv->verify_print_snapshots);
+ 
+       if (error)
+         {
+@@ -1629,6 +1699,7 @@ identify_cb (FpDevice *dev, GAsyncResult *res, void *user_data)
+   else
+     {
+       g_clear_pointer (&priv->identify_data, g_ptr_array_unref);
++      g_hash_table_remove_all (priv->verify_print_snapshots);
+ 
+       if (error)
+         {
+@@ -1713,6 +1784,9 @@ fprint_device_verify_start (FprintDBusDevice      *dbus_dev,
+       g_debug ("start identification device %d", priv->id);
+       priv->current_cancellable = g_cancellable_new ();
+       priv->identify_data = g_ptr_array_ref (gallery);
++      g_hash_table_remove_all (priv->verify_print_snapshots);
++      for (guint i = 0; i < gallery->len; i++)
++        snapshot_verify_print (rdev, g_ptr_array_index (gallery, i));
+       fp_device_identify (priv->dev, gallery, priv->current_cancellable,
+                           match_cb, rdev, NULL,
+                           (GAsyncReadyCallback) identify_cb, rdev);
+@@ -1748,6 +1822,8 @@ fprint_device_verify_start (FprintDBusDevice      *dbus_dev,
+       priv->current_action = ACTION_VERIFY;
+       priv->current_cancellable = g_cancellable_new ();
+       priv->verify_data = g_object_ref (print);
++      g_hash_table_remove_all (priv->verify_print_snapshots);
++      snapshot_verify_print (rdev, print);
+       fp_device_verify (priv->dev, print, priv->current_cancellable,
+                         match_cb, rdev, NULL,
+                         (GAsyncReadyCallback) verify_cb, rdev);

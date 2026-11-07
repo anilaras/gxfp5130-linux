@@ -6,6 +6,13 @@ entegrasyonu ve PAM kurulumu bir arada.
 
 **[English](README.md)** | Türkçe
 
+> [!NOTE]
+> **Bu fork hakkında:** SIGFM yerine Goodix'in **Chicago** eşleştiricisi kullanılıyor.
+> Windows kalibrasyonu (`goodix_calib.dat`), T0 doğrulaması, kirli kare kontrolü,
+> öğrenen şablon (yamalı fprintd) ve hız iyileştirmeleri eklendi. Kurulum
+> `sh kur.sh` ile yapılıyor. Ayrıntılar, ölçümler ve güvenlik notları için
+> **[KURULUM.md](KURULUM.md)**.
+
 [![Kernel Patch: İncelemede](https://img.shields.io/badge/Kernel%20Patch-%C4%B0ncelemede-yellow.svg)](https://lore.kernel.org/linux-kernel/20260718080917.21893-1-metehangnen@gmail.com/)
 
 > Huawei MateBook D16 2024 (MCLF-XX) üzerinde çalışıyor.

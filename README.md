@@ -8,6 +8,52 @@ readm
 
 English | **[Türkçe](README.tr.md)**
 
+> [!NOTE]
+> **About this fork.** It replaces the SIGFM matcher with the native Goodix
+> **Chicago** matcher. The GXFP5130 is a ChicagoHS sensor: its Windows calibration
+> file `goodix_calib.dat` has exactly the layout the Chicago backend expects.
+> Installation is through [`kur.sh`](kur.sh); full notes in Turkish are in
+> [KURULUM.md](KURULUM.md).
+>
+> | | Upstream (SIGFM) | This fork (Chicago) |
+> |---|---|---|
+> | Genuine finger accepted, per attempt | ~10% | ~60–80% |
+> | Other fingers accepted, per attempt | ~0% | ~4% (5 of 128) |
+>
+> Measured on a single Huawei MDF-XX (FW `GF_GCC_EC_20055`) with a small set of
+> the owner's own fingers. Treat fingerprint unlock as a convenience, not a
+> security boundary.
+>
+> **Changes:**
+> - The libfprint `gxfp` driver is rewritten around the Chicago matcher.
+>   The matcher is vendored from
+>   [berkekbgz/libfprint-goodix-spi](https://github.com/berkekbgz/libfprint-goodix-spi)
+>   (LGPL-2.1+), see `libfprint/libfprint/drivers/gxfp-chicago/README`. Matching
+>   uses raw frames plus the Windows gain/offset calibration (`calib/README.md`).
+> - **T0 (no-finger frame) validation.** The sensor keeps a latent print for a few
+>   seconds after each touch. Two no-finger frames are compared 0.3 s apart, and
+>   only a settled frame is used; otherwise the last good one (cached) is kept.
+> - **Smudge gate.** Frames whose ridge signal is at the noise floor (smudged
+>   sensor or wet finger) are rejected as a retry instead of being matched.
+> - **Adaptive template (Chicago templateStudy).** It needs a small fprintd patch
+>   ([`fprintd-1.94.5-print-persist.patch`](fprintd-1.94.5-print-persist.patch)) so
+>   that updated prints are saved. `kur.sh` builds it and runs it through a
+>   systemd drop-in; the distribution package is left untouched.
+> - **Finger-up fix.** Backported from Void755/gxfpmoc `42860c1`: invalid FDT
+>   baselines are ignored.
+> - **Faster response.** A match is reported without waiting for the lift.
+>   Activation does not stall when a finger is already down.
+>
+> **Install:**
+> ```sh
+> cp /path/to/windows/ProgramData/Goodix/goodix_calib.dat calib/
+> sh kur.sh                 # DKMS module, libfprint, patched fprintd
+> fprintd-delete $USER && fprintd-enroll
+> sh pam-ayar.sh            # sudo/polkit: 3 fingerprint attempts
+> ```
+> To uninstall, run `sh kaldir.sh`. The PSK still has to be provisioned as
+> described below.
+
 [![License: GPL-2.0](https://img.shields.io/badge/License-GPL--2.0-blue.svg)](LICENSE)
 [![Kernel Patch: Under Review](<https://img.shields.io/badge/Kernel%20Patch-Under%20Review-yellow.svg>)](https://lore.kernel.org/linux-kernel/20260718080917.21893-1-metehangnen@gmail.com/)
 

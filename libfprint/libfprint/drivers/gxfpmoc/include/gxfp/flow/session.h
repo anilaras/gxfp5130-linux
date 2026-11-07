@@ -90,6 +90,23 @@ void gxfp_session_pump(struct gxfp_session *s,
                        struct gxfp_session_events *ev);
 
 int gxfp_session_take_image(struct gxfp_session *s, struct gxfp_decoded_image *out);
+/* Deliver captures without dark-frame (FPN) correction, for matchers that do
+ * their own calibration. */
+void gxfp_session_set_raw_output(struct gxfp_session *s, int enable);
+/* Copy the no-finger frame captured during the last activation. Returns the
+ * pixel count, -ENOENT when none is loaded, -EMSGSIZE when out is too small. */
+int gxfp_session_get_dark(const struct gxfp_session *s, uint16_t *out,
+                          size_t out_count, int *rows, int *cols);
+/* In raw-output mode activation takes two no-finger frames ~0.3 s apart.
+ * Reports how much the second differs from the first (mean and standard
+ * deviation of the pixel difference); -ENOENT when no pair was taken. */
+int gxfp_session_get_dark_stability(const struct gxfp_session *s,
+                                    double *mean_diff, double *std_diff);
+/* Raw-output mode: a known-rested frame to compare the first no-finger frame
+ * against. When they agree within the limits the second frame is skipped and
+ * the stability figures describe the difference to this reference. NULL clears. */
+void gxfp_session_set_dark_reference(struct gxfp_session *s, const uint16_t *ref,
+                                     size_t count, double max_mean, double max_std);
 int gxfp_session_poll_readable(const struct gxfp_session *s, int timeout_ms);
 
 #ifdef __cplusplus
